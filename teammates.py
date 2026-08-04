@@ -57,6 +57,33 @@ def list_active_teammates() -> list[str]:
         return list(active_teammates)
 
 
+def recent_messages(messages: list, limit: int = 20) -> list:
+    """Keep a recent window without splitting tool_use/tool_result pairs."""
+    start = max(0, len(messages) - limit)
+    if start == 0:
+        return messages
+    current = messages[start]
+    previous = messages[start - 1]
+    current_content = current.get("content")
+    previous_content = previous.get("content")
+    starts_with_result = (
+        current.get("role") == "user"
+        and isinstance(current_content, list)
+        and any(isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                for block in current_content))
+    previous_has_use = (
+        previous.get("role") == "assistant"
+        and isinstance(previous_content, list)
+        and any(getattr(block, "type", None) == "tool_use"
+                or (isinstance(block, dict)
+                    and block.get("type") == "tool_use")
+                for block in previous_content))
+    if starts_with_result and previous_has_use:
+        start -= 1
+    return messages[start:]
+
+
 
 # ── Protocol State ──
 
@@ -190,7 +217,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                            else f"[Plan rejected] {msg['content']}"})
         return False
 
-    def run():
+    def run_inner():
         wt_ctx = {"path": None}
 
         def _wt_cwd():
@@ -313,7 +340,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
                 try:
                     response = client.messages.create(
-                        model=MODEL, system=system, messages=messages[-20:],
+                        model=MODEL, system=system,
+                        messages=recent_messages(messages),
                         tools=sub_tools, max_tokens=8000)
                 except Exception:
                     break
@@ -321,24 +349,30 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 if not has_tool_use(response.content):
                     break
                 results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "submit_plan":
-                            output = _teammate_submit_plan(
-                                name, block.input.get("plan", ""))
-                            match = re.search(r"\((req_\d+)\)", output)
-                            protocol_ctx["waiting_plan"] = (
-                                match.group(1) if match else output)
-                        else:
-                            output = execute_tool_call(
-                                block, sub_handlers.get(block.name))
+                tool_blocks = [block for block in response.content
+                               if block.type == "tool_use"]
+                plan_block = next(
+                    (block for block in tool_blocks
+                     if block.name == "submit_plan"), None)
+                if plan_block is not None:
+                    output = _teammate_submit_plan(
+                        name, plan_block.input.get("plan", ""))
+                    match = re.search(r"\((req_\d+)\)", output)
+                    protocol_ctx["waiting_plan"] = (
+                        match.group(1) if match else output)
+                    for block in tool_blocks:
+                        content = (output if block is plan_block else
+                                   "Deferred until the submitted plan is reviewed.")
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": str(content)})
+                else:
+                    for block in tool_blocks:
+                        output = execute_tool_call(
+                            block, sub_handlers.get(block.name))
                         results.append({"type": "tool_result",
                                         "tool_use_id": block.id,
                                         "content": str(output)})
-                        if protocol_ctx["waiting_plan"]:
-                            # Ignore later tool_use blocks from the same model
-                            # response; they belong after approval, not before.
-                            break
                 messages.append({"role": "user", "content": results})
                 if protocol_ctx["waiting_plan"]:
                     break
@@ -363,6 +397,16 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         BUS.send(name, "lead", summary, "result")
         with active_teammates_lock:
             active_teammates.pop(name, None)
+
+    def run():
+        try:
+            run_inner()
+        except Exception as exc:
+            try:
+                BUS.send(name, "lead", f"Teammate failed: {exc}", "error")
+            finally:
+                with active_teammates_lock:
+                    active_teammates.pop(name, None)
 
     threading.Thread(target=run, daemon=True).start()
     return f"Teammate '{name}' spawned as {role}"

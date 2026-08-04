@@ -13,6 +13,17 @@ export MODEL_ID="your-model-id"
 python main.py
 ```
 
+默认使用启动命令所在目录作为工作区。也可以通过 `--workdir` 或 `-C`
+指定其他项目目录；相对路径按启动命令所在目录解析：
+
+```bash
+python main.py --workdir /path/to/project
+python main.py -C ../another-project
+```
+
+指定工作目录后，文件工具、任务、skills、transcript、worktree 和定时任务
+持久化路径都会基于该目录；Agent API 凭据仍优先从本程序目录的 `.env` 加载。
+
 也可以在项目根目录创建 `.env`，写入相同的 `ANTHROPIC_API_KEY` 与 `MODEL_ID`。可选配置项包括 `ANTHROPIC_BASE_URL`（兼容网关地址）和 `FALLBACK_MODEL_ID`（服务过载时使用的后备模型）。在交互界面输入 `q`、`exit` 或空行可退出。
 
 ## 总体架构
@@ -109,19 +120,20 @@ Hook 注册点在 `tools.py`，新增策略无需修改各个工具实现。
 
 ## 上下文与可靠性设计
 
-`context.py` 采用分层治理：先把超过阈值的工具输出转存到磁盘并保留预览，再裁剪历史消息、压缩旧轮工具结果；仍超过 `CONTEXT_LIMIT` 时才调用模型生成摘要。若服务端报上下文过长，`agent.py` 会执行一次 reactive compaction 后重试。
+`context.py` 采用分层治理：先把超过阈值的工具输出转存到磁盘并保留预览，再压缩旧轮工具结果；请求预算会同时估算 system prompt、消息和工具 schema，在输入超过 800k token 软阈值或挤占预留输出空间时，将较早历史摘要为结构化 checkpoint，并原样保留最近消息。摘要失败时不会覆盖原历史；若服务端仍报上下文过长，`agent.py` 会执行一次 reactive compaction 后重试。
 
-模型请求使用流式接口。网络限流（429）和过载（529）采用指数退避；连续过载达到阈值时，如配置了 `FALLBACK_MODEL_ID` 则切换后备模型。对于 `max_tokens` 截断，先提升输出额度，再注入 continuation prompt 继续执行。
+模型请求使用流式接口。网络限流（429）和过载（529）采用指数退避；连续过载达到阈值时，如配置了 `FALLBACK_MODEL_ID` 则切换后备模型。正常输出预算为 32k token，截断续写提升到 128k，并始终受模型 384k 硬上限和剩余上下文空间约束；已经生成的部分会保留后再续写，工具调用则先回填对应的 `tool_result`。
 
 ## 多代理与任务协作
 
 `task` 是前台同步子代理：仅拥有文件与 Shell 等核心工具，完成后将简短总结返回主代理。
 
-`spawn_teammate` 创建后台自治队友。队友通过 `.mailboxes` 与 `lead` 通信，空闲时会扫描并原子认领无依赖阻塞的任务。若任务绑定 Git worktree，队友的文件和 Shell 工具会自动切换到该目录。计划提交后会等待 lead 的批准或拒绝；关停请求也通过带 `request_id` 的协议消息配对，避免串台。
+`spawn_teammate` 创建后台自治队友。队友通过 `.mailboxes` 与 `lead` 通信，lead 的后台事件循环会主动消费新消息；队友空闲时会扫描并原子认领无依赖阻塞的任务。若任务绑定 Git worktree，队友的文件和 Shell 工具会自动切换到该目录。计划提交后会等待 lead 的批准或拒绝；关停请求也通过带 `request_id` 的协议消息配对，避免串台。
 
 ## 开发提示
 
 - `WORKDIR` 取进程启动目录，因此建议始终在项目根目录执行 `python main.py`。
 - worktree 功能依赖当前目录处于 Git 仓库且存在 `HEAD`；删除默认会检查未提交修改与未推送提交。
 - 定时表达式使用五段格式：`分 时 日 月 周`，支持 `*`、`*/n`、列表和范围；日与周字段同时指定时遵循 cron 常见的“任一匹配”语义。
+- 同一个 cron job 执行期间不会重复入队；一次性任务会在 Agent 执行返回后再从持久化列表删除。
 - 本仓库目前未包含自动化测试套件。修改后可先运行 `python -m py_compile *.py` 进行基础语法检查。

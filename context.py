@@ -1,11 +1,14 @@
 """Context budget pipeline: compaction, transcripts, reactive recovery."""
 from __future__ import annotations
 
-import json, time
+import json, math, time, uuid
 from pathlib import Path
 
 from config import (client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR,
-                    PERSIST_THRESHOLD, CONTEXT_LIMIT)
+                    PERSIST_THRESHOLD, MODEL_CONTEXT_TOKENS,
+                    MODEL_MAX_OUTPUT_TOKENS, CONTEXT_COMPACT_THRESHOLD,
+                    CONTEXT_SAFETY_MARGIN, MIN_OUTPUT_TOKENS,
+                    SUMMARY_MAX_TOKENS, SUMMARY_KEEP_MESSAGES)
 from tools import extract_text
 
 
@@ -14,10 +17,55 @@ from tools import extract_text
 # Compaction is layered: first shrink oversized tool results, then trim old
 # message ranges, and only call the model for a summary when the context is
 # still too large or the model explicitly asks for compact.
+def estimate_tokens(value) -> int:
+    """Estimate tokens using DeepSeek's documented character ratios.
+
+    English letters/whitespace use 0.3 token per character, Chinese characters
+    use 0.6, and digits or symbols use 1.  A 10% margin absorbs normal tokenizer
+    variation and the approximation involved in serializing SDK content blocks.
+    """
+    text = json.dumps(value, default=str, ensure_ascii=False)
+    weighted = sum(_token_weight(char) for char in text)
+    return max(1, math.ceil(weighted * 1.10))
+
+
+def _token_weight(char: str) -> float:
+    codepoint = ord(char)
+    is_chinese = (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x323AF
+    )
+    if is_chinese:
+        return 0.6
+    if char.isascii() and (char.isalpha() or char.isspace()):
+        return 0.3
+    return 1.0
+
+
 def estimate_size(messages: list) -> int:
-    # Do not turn each Chinese character into a six-character ``\uXXXX``
-    # escape; doing so makes multilingual conversations compact far too early.
-    return len(json.dumps(messages, default=str, ensure_ascii=False))
+    """Backward-compatible alias; the returned unit is now estimated tokens."""
+    return estimate_tokens(messages)
+
+
+def estimate_request_tokens(messages: list, system: str = "",
+                            tools: list | None = None) -> int:
+    return estimate_tokens({
+        "system": system,
+        "messages": messages,
+        "tools": tools or [],
+    })
+
+
+def fit_max_tokens(messages: list, system: str, tools: list,
+                   requested: int) -> int:
+    input_tokens = estimate_request_tokens(messages, system, tools)
+    available = MODEL_CONTEXT_TOKENS - input_tokens - CONTEXT_SAFETY_MARGIN
+    if available < MIN_OUTPUT_TOKENS:
+        raise ValueError(
+            "context_length_exceeded: insufficient output budget after input")
+    return min(requested, MODEL_MAX_OUTPUT_TOKENS, available)
 
 def block_type(block):
     return block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
@@ -129,7 +177,8 @@ def micro_compact(messages: list, history_limit: int = 2000) -> list:
 
 def write_transcript(messages: list) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    path = TRANSCRIPT_DIR / f"transcript_{stamp}_{uuid.uuid4().hex[:8]}.jsonl"
     with path.open("w", encoding="utf-8") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
@@ -137,45 +186,69 @@ def write_transcript(messages: list) -> Path:
 
 
 def summarize_history(messages: list) -> str:
-    conversation = json.dumps(messages, default=str)[:80000]
-    prompt = ("Summarize this coding-agent conversation so work can continue. "
-              "Preserve current goal, key findings, changed files, remaining work, "
-              "and user constraints.\n\n" + conversation)
+    if not messages:
+        raise ValueError("Cannot summarize an empty history")
+    conversation = json.dumps(messages, default=str, ensure_ascii=False)
+    prompt = (
+        "Create a compact checkpoint for this coding-agent conversation. "
+        "Use these headings: Current goal, User constraints, Confirmed facts, "
+        "Changed files, Verification performed, Remaining work, Blockers. "
+        "Preserve exact paths, commands, errors, decisions, and unfinished work.\n\n"
+        + conversation)
     response = client.messages.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000)
-    return extract_text(response.content) or "(empty summary)"
+        max_tokens=SUMMARY_MAX_TOKENS,
+        extra_body={"reasoning": {"effort": "none"}})
+    if response.stop_reason == "max_tokens":
+        raise RuntimeError("Summary was truncated at max_tokens")
+    summary = extract_text(response.content)
+    if not summary:
+        raise RuntimeError("Summary response was empty")
+    return summary
 
 
-def compact_history(messages: list) -> list:
-    transcript = write_transcript(messages)
-    print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
-    summary = summarize_history(messages)
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
-
-
-def reactive_compact(messages: list) -> list:
-    transcript = write_transcript(messages)
-    print(f"  \033[31m[reactive compact] transcript saved: {transcript}\033[0m")
-    tail_start = max(0, len(messages) - 5)
+def recent_tail_start(messages: list,
+                      keep_messages: int = SUMMARY_KEEP_MESSAGES) -> int:
+    """Choose a recent tail without separating tool_use from tool_result."""
+    tail_start = max(1, len(messages) - keep_messages)
     if (tail_start > 0 and tail_start < len(messages)
             and is_tool_result_message(messages[tail_start])
             and message_has_tool_use(messages[tail_start - 1])):
         tail_start -= 1
+    return tail_start
+
+
+def compact_history(messages: list,
+                    keep_messages: int = SUMMARY_KEEP_MESSAGES) -> list:
+    if len(messages) <= 1:
+        return messages
+    transcript = write_transcript(messages)
+    print(f"  \033[36m[compact] transcript saved: {transcript}\033[0m")
+    tail_start = recent_tail_start(messages, keep_messages)
+    older, recent = messages[:tail_start], messages[tail_start:]
     try:
-        summary = summarize_history(messages[:tail_start])
-    except Exception:
-        summary = "Earlier conversation was trimmed after a prompt-too-long error."
-    return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"},
-            *messages[tail_start:]]
+        summary = summarize_history(older)
+    except Exception as exc:
+        print(f"  \033[31m[compact] summary failed; history kept: {exc}\033[0m")
+        return messages
+    return [{"role": "user", "content": f"[Compacted checkpoint]\n\n{summary}"},
+            *recent]
 
 
-def prepare_context(messages: list) -> list:
+def reactive_compact(messages: list) -> list:
+    return compact_history(messages, keep_messages=5)
+
+
+def prepare_context(messages: list, system: str = "", tools: list | None = None,
+                    reserved_output: int = 0) -> list:
     # Every LLM turn enters through the same context budget pipeline.
     messages[:] = tool_result_budget(messages)
-    messages[:] = snip_compact(messages)
     messages[:] = micro_compact(messages)
-    if estimate_size(messages) > CONTEXT_LIMIT:
+    input_tokens = estimate_request_tokens(messages, system, tools or [])
+    hard_input_limit = (MODEL_CONTEXT_TOKENS - CONTEXT_SAFETY_MARGIN
+                        - max(reserved_output, MIN_OUTPUT_TOKENS))
+    if (input_tokens > CONTEXT_COMPACT_THRESHOLD
+            or input_tokens > hard_input_limit):
         messages[:] = compact_history(messages)
     return messages

@@ -1,25 +1,48 @@
 """CLI entry point for the s20 coding agent."""
 from __future__ import annotations
 
+import argparse
+import os
 import threading
-
-import config
-from skills import scan_skills
-from cron import cron_scheduler_loop, load_durable_jobs
-from agent import (agent_loop, cron_autorun_loop, print_turn_assistants,
-                   agent_lock, update_context)
-from tools import trigger_hooks
-from teammates import consume_lead_inbox
-from working_state import WorkingState
+from pathlib import Path
 
 
-def main() -> None:
+def existing_directory(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(
+            f"work directory does not exist or is not a directory: {value}")
+    return path
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the s20 coding agent")
+    parser.add_argument(
+        "-C", "--workdir", type=existing_directory, default=Path.cwd(),
+        help="workspace directory used by the agent (default: current directory)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    # config.py captures Path.cwd() during import, so switch directories before
+    # importing any project module that derives workspace paths from it.
+    os.chdir(args.workdir)
+
+    import config
+    from skills import scan_skills
+    from cron import cron_scheduler_loop, load_durable_jobs
+    from agent import (agent_loop, cron_autorun_loop, print_turn_assistants,
+                       agent_lock, update_context)
+    from tools import trigger_hooks
+    from working_state import WorkingState
+
     config.CLI_ACTIVE = True
     scan_skills()
     load_durable_jobs()
     threading.Thread(target=cron_scheduler_loop, daemon=True).start()
 
-    print("s20: comprehensive agent")
+    print(f"a comprehensive agent ({config.WORKDIR})")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
     working_state = WorkingState()
@@ -46,20 +69,6 @@ def main() -> None:
             agent_loop(history, context, working_state)
             context.update(update_context(context, history))
             print_turn_assistants(history, turn_start)
-            # History is owned by the serialized agent runner.  Teammate
-            # messages are appended while holding the same lock as cron work.
-            inbox = consume_lead_inbox(route_protocol=True)
-            if inbox:
-                def inbox_label(msg):
-                    req_id = msg.get("metadata", {}).get("request_id", "")
-                    suffix = f" req:{req_id}" if req_id else ""
-                    return f"{msg.get('type', 'message')}{suffix}"
-
-                inbox_text = "\n".join(
-                    f"From {m['from']} [{inbox_label(m)}]: "
-                    f"{m['content'][:200]}" for m in inbox)
-                history.append({"role": "user",
-                                "content": f"[Inbox]\n{inbox_text}"})
         print()
 
 

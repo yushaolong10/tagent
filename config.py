@@ -43,7 +43,12 @@ except ImportError:
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(override=True)
+    # Keep API configuration tied to the agent installation when main.py uses
+    # --workdir to operate on a different repository. If no local file exists,
+    # python-dotenv retains its normal discovery behavior.
+    _agent_env = Path(__file__).resolve().with_name(".env")
+    load_dotenv(dotenv_path=_agent_env if _agent_env.exists() else None,
+                override=True)
 except ImportError:  # optional: env vars can be exported directly instead
     load_dotenv = None
 
@@ -89,15 +94,17 @@ TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 # but the recovery value should still leave ample room for the input context.
 DEFAULT_MAX_TOKENS = 32000
 ESCALATED_MAX_TOKENS = 128000
+MODEL_CONTEXT_TOKENS = 1_000_000
+MODEL_MAX_OUTPUT_TOKENS = 384_000
+CONTEXT_COMPACT_THRESHOLD = 800_000
+CONTEXT_SAFETY_MARGIN = 16_000
+MIN_OUTPUT_TOKENS = 8_000
+SUMMARY_MAX_TOKENS = 8_000
+SUMMARY_KEEP_MESSAGES = 20
 MAX_RETRIES = 5
 MAX_CONSECUTIVE_529 = 2
 MAX_RECOVERY_RETRIES = 2
 BASE_DELAY_MS = 1000
-# This remains a conservative character-based approximation rather than an
-# exact token counter.  With JSON Unicode escaping disabled in context.py,
-# 1.2M serialized characters gives DeepSeek V4 Flash substantially more useful
-# history while retaining headroom inside its 1M-token context window.
-CONTEXT_LIMIT = 1_200_000
 # Outputs above 10k chars are offloaded to .task_outputs/tool-results/ by
 # tool_result_budget (kept in sync with its max_bytes so the layer can shrink
 # oversized single results).

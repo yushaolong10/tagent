@@ -9,13 +9,13 @@ from config import (client, WORKDIR, CONTINUATION_PROMPT, DEFAULT_MAX_TOKENS,
                     BASE_DELAY_MS, MAX_RETRIES, MAX_CONSECUTIVE_529,
                     FALLBACK_MODEL, PRIMARY_MODEL)
 from mcp import mcp_clients
-from teammates import list_active_teammates
+from teammates import list_active_teammates, consume_lead_inbox
 from tools import call_tool_handler, execute_tool_call, has_tool_use, trigger_hooks
 from skills import assemble_system_prompt
-from cron import consume_cron_queue
+from cron import consume_cron_queue, finish_fired_jobs
 from toolpool import assemble_tool_pool
 from context import prepare_context, compact_history, reactive_compact,\
-                   block_type
+                   block_type, fit_max_tokens
 from working_state import WorkingState
 
 
@@ -174,6 +174,11 @@ def inject_background_notifications(messages: list):
 def call_llm(messages: list, context: dict, tools: list,
              state: RecoveryState, max_tokens: int):
     system = assemble_system_prompt(context)
+    effective_max_tokens = fit_max_tokens(
+        messages, system, tools, max_tokens)
+    if effective_max_tokens != max_tokens:
+        print(f"  \033[33m[token budget] max_tokens reduced to "
+              f"{effective_max_tokens}\033[0m")
 
     def _stream_once():
         # Streaming is required for large max_tokens: the SDK rejects
@@ -185,7 +190,7 @@ def call_llm(messages: list, context: dict, tools: list,
             system=system,
             messages=messages,
             tools=tools,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
         ) as stream:
             return stream.get_final_message()
 
@@ -213,10 +218,12 @@ def agent_loop(messages: list, context: dict, working_state: WorkingState | None
         # model/tool progression for the already-selected conversation turn.
         inject_background_notifications(messages)
 
-        prepare_context(messages)
         context = update_context(context, messages)
         context["working_state"] = working_state.to_prompt()
         tools, handlers = assemble_tool_pool()
+        system = assemble_system_prompt(context)
+        prepare_context(messages, system=system, tools=tools,
+                        reserved_output=max_tokens)
 
         try:
             response = call_llm(messages, context, tools, state, max_tokens)
@@ -229,23 +236,25 @@ def agent_loop(messages: list, context: dict, working_state: WorkingState | None
                 {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
             return
 
-        if response.stop_reason == "max_tokens":
-            if not state.has_escalated:
-                max_tokens = ESCALATED_MAX_TOKENS
-                state.has_escalated = True
-                print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
-                continue
-            messages.append({"role": "assistant", "content": response.content})
-            if state.recovery_count < MAX_RECOVERY_RETRIES:
-                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
-                state.recovery_count += 1
-                continue
-            return
-
-        max_tokens = DEFAULT_MAX_TOKENS
-        state.has_escalated = False
+        was_truncated = response.stop_reason == "max_tokens"
         messages.append({"role": "assistant", "content": response.content})
+        truncation_exhausted = (
+            was_truncated
+            and state.recovery_count >= MAX_RECOVERY_RETRIES)
+        if was_truncated and not truncation_exhausted:
+            state.recovery_count += 1
+            max_tokens = ESCALATED_MAX_TOKENS
+            state.has_escalated = True
+        elif not was_truncated:
+            state.recovery_count = 0
+            max_tokens = DEFAULT_MAX_TOKENS
+            state.has_escalated = False
         if not has_tool_use(response.content):
+            if was_truncated and not truncation_exhausted:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                print(f"  \033[33m[max_tokens] continuing with up to "
+                      f"{max_tokens} tokens\033[0m")
+                continue
             trigger_hooks("Stop", messages)
             return
 
@@ -257,7 +266,10 @@ def agent_loop(messages: list, context: dict, working_state: WorkingState | None
             print(f"\033[36m> {block.name}\033[0m")
 
             if block.name == "compact":
-                messages[:] = compact_history(messages)
+                # Exclude the assistant message containing the compact tool_use;
+                # otherwise preserving the recent tail would leave an unmatched
+                # tool invocation in the replacement history.
+                messages[:] = compact_history(messages[:-1])
                 messages.append({"role": "user",
                                  "content": "[Compacted. Continue with summarized context.]"})
                 compacted_now = True
@@ -282,7 +294,7 @@ def agent_loop(messages: list, context: dict, working_state: WorkingState | None
                 block, handlers.get(block.name),
                 after=lambda tool_block, result: _record_tool_result(
                     working_state, tool_block, result))
-            print(str(output)[:300])
+            print(str(output)[:3000])
 
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
@@ -291,6 +303,11 @@ def agent_loop(messages: list, context: dict, working_state: WorkingState | None
             continue
 
         messages.append({"role": "user", "content": build_user_content(results)})
+        if truncation_exhausted:
+            working_state.record_blocker(
+                "Response remained truncated after maximum recovery attempts")
+            trigger_hooks("Stop", messages)
+            return
 
 
 def print_turn_assistants(messages: list, turn_start: int):
@@ -307,18 +324,35 @@ def cron_autorun_loop(history: list, context: dict,
     while True:
         time.sleep(1)
         fired = consume_cron_queue()
-        if not fired:
-            continue
         with agent_lock:
+            inbox = consume_lead_inbox(route_protocol=True)
+            if not fired and not inbox:
+                continue
             turn_start = len(history)
             if working_state is not None:
-                working_state.start_turn(
-                    "Scheduled work: " + "; ".join(job.prompt for job in fired))
+                goals = ["Scheduled work: " + "; ".join(
+                    job.prompt for job in fired)] if fired else []
+                if inbox:
+                    goals.append("Handle teammate inbox")
+                working_state.start_turn("; ".join(goals))
             for job in fired:
                 history.append({"role": "user",
                                 "content": f"[Scheduled] {job.prompt}"})
                 terminal_print(
                     f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m")
-            agent_loop(history, context, working_state)
+            if inbox:
+                inbox_text = "\n".join(
+                    f"From {msg['from']} [{msg.get('type', 'message')}"
+                    f" req:{msg.get('metadata', {}).get('request_id', '')}]: "
+                    f"{msg['content'][:1000]}" for msg in inbox)
+                history.append({"role": "user",
+                                "content": f"[Teammate inbox]\n{inbox_text}"})
+            try:
+                agent_loop(history, context, working_state)
+            except Exception as exc:
+                finish_fired_jobs(fired, successful=False)
+                terminal_print(f"  \033[31m[autorun error] {exc}\033[0m")
+                continue
+            finish_fired_jobs(fired, successful=True)
             context.update(update_context(context, history))
             print_turn_assistants(history, turn_start)

@@ -96,7 +96,7 @@ def assemble_system_prompt(context: dict) -> str:
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["efficiency"],
                 PROMPT_SECTIONS["workspace"]]
-    sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
+    sections.append(f"Current date: {datetime.now().date().isoformat()}")
     sections.append("Skills catalog:\n" + list_skills() +
                     "\nUse load_skill(name) when a skill is relevant.")
     if context.get("memories"):

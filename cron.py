@@ -29,6 +29,7 @@ scheduled_jobs: dict[str, CronJob] = {}
 cron_queue: list[CronJob] = []
 cron_lock = threading.RLock()
 _last_fired: dict[str, str] = {}
+_in_flight: set[str] = set()
 
 
 def _cron_field_matches(field: str, value: int) -> bool:
@@ -153,6 +154,7 @@ def schedule_job(cron: str, prompt: str,
 def cancel_job(job_id: str) -> str:
     with cron_lock:
         job = scheduled_jobs.pop(job_id, None)
+        _in_flight.discard(job_id)
     if not job:
         return f"Job {job_id} not found"
     if job.durable:
@@ -168,13 +170,12 @@ def cron_scheduler_loop():
         with cron_lock:
             for job in list(scheduled_jobs.values()):
                 try:
-                    if cron_matches(job.cron, now) and _last_fired.get(job.id) != marker:
+                    if (cron_matches(job.cron, now)
+                            and _last_fired.get(job.id) != marker
+                            and job.id not in _in_flight):
                         cron_queue.append(job)
+                        _in_flight.add(job.id)
                         _last_fired[job.id] = marker
-                        if not job.recurring:
-                            scheduled_jobs.pop(job.id, None)
-                            if job.durable:
-                                save_durable_jobs()
                 except Exception as e:
                     print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
 
@@ -184,6 +185,23 @@ def consume_cron_queue() -> list[CronJob]:
         fired = list(cron_queue)
         cron_queue.clear()
     return fired
+
+
+def finish_fired_jobs(jobs: list[CronJob], successful: bool = True) -> None:
+    """Acknowledge execution and delete one-shot jobs only after success."""
+    persist_changed = False
+    with cron_lock:
+        for job in jobs:
+            _in_flight.discard(job.id)
+            if successful and not job.recurring:
+                removed = scheduled_jobs.pop(job.id, None)
+                persist_changed = persist_changed or bool(
+                    removed and removed.durable)
+            elif not successful:
+                # Permit another scheduler tick to retry a failed execution.
+                _last_fired.pop(job.id, None)
+    if persist_changed:
+        save_durable_jobs()
 
 
 def run_schedule_cron(cron: str, prompt: str,
